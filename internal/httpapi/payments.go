@@ -30,7 +30,7 @@ type PaymentHandler struct {
 	router   *routing.Router
 	locker   *KeyLocker
 	logger   *slog.Logger
-	metrics  *metrics.Registry // <-- NEW
+	metrics  *metrics.Registry
 }
 
 func NewPaymentHandler(s store.Store, r *routing.Router, l *KeyLocker, logger *slog.Logger, m *metrics.Registry) *PaymentHandler {

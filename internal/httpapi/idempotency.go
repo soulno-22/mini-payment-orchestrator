@@ -36,7 +36,6 @@ func (l *KeyLocker) Lock(key string) func() {
 	return func() {
 		<-ch // Release
 		l.mu.Lock()
-		// Optional: Clean up the map if empty, but for this project we'll leave it.
 		l.mu.Unlock()
 	}
 }

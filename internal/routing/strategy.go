@@ -5,18 +5,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/soulno-22/mini-payment-orchestrator/internal/provider"
 	"github.com/soulno-22/mini-payment-orchestrator/internal/metrics"
+	"github.com/soulno-22/mini-payment-orchestrator/internal/provider"
 )
 
-// RoutingStrategy is an extension point.
-// You can implement a new strategy (e.g., lowest cost, geo-based) without
-// changing the Router.
+// RoutingStrategy is the extension point for picking a provider.
+// Want geo-routing? Lowest-cost routing? Write a new struct that
+// implements Pick and pass it to NewRouter. The router itself stays dumb.
 type RoutingStrategy interface {
 	Pick(providers []provider.ProviderAdapter) provider.ProviderAdapter
 }
 
-// Router handles retries, fallbacks, and uses Circuit Breakers.
+// Router handles retries, fallbacks, and circuit breaking.
 type Router struct {
 	Providers []provider.ProviderAdapter
 	Breakers  map[string]*CircuitBreaker
@@ -27,8 +27,8 @@ type Router struct {
 func NewRouter(providers []provider.ProviderAdapter, strategy RoutingStrategy, m *metrics.Registry) *Router {
 	breakers := make(map[string]*CircuitBreaker)
 	for _, p := range providers {
-		// Default parameters for all providers:
-		// Trip after 3 consecutive failures. Stay open for 5 seconds.
+		// Trip after 3 consecutive failures, stay open for 5s.
+		// Hardcoded for now; a real system would read this from config.
 		breakers[p.Name()] = NewCircuitBreaker(3, 5*time.Second)
 	}
 	return &Router{
@@ -39,26 +39,23 @@ func NewRouter(providers []provider.ProviderAdapter, strategy RoutingStrategy, m
 	}
 }
 
-// Charge attempts to charge using the routing logic.
+// Charge tries the preferred provider first, then falls back to the rest.
+// The fallback loop is intentionally flat (not a graph) — enough to prove
+// the concept without a routing DSL.
 func (r *Router) Charge(ctx context.Context, req provider.ChargeRequest) (*provider.ChargeResponse, error) {
-	// For simplicity, we just loop through the chosen provider, then fallback.
-	// A true production system would use a graph of fallbacks.
-	
 	chosen := r.Strategy.Pick(r.Providers)
 	if chosen == nil {
 		return nil, provider.ErrProviderDeclined
 	}
 
-	// 1. Try chosen provider
 	resp, err := r.tryProvider(ctx, chosen, req)
 	if err == nil {
 		return resp, nil
 	}
 
-	// 2. Fallback: try the other providers
 	for _, p := range r.Providers {
 		if p.Name() == chosen.Name() {
-			continue // already tried
+			continue
 		}
 		resp, err := r.tryProvider(ctx, p, req)
 		if err == nil {
@@ -66,17 +63,20 @@ func (r *Router) Charge(ctx context.Context, req provider.ChargeRequest) (*provi
 		}
 	}
 
-	return nil, provider.ErrProviderDeclined // All failed
+	return nil, provider.ErrProviderDeclined
 }
 
+// tryProvider is where the circuit breaker + retry policy actually live.
+// Note: the breaker records failures per-attempt, which means one bad
+// payment can trip it faster than expected. That's a deliberate choice —
+// we'd rather be too conservative than hammer a dead provider.
 func (r *Router) tryProvider(ctx context.Context, p provider.ProviderAdapter, req provider.ChargeRequest) (*provider.ChargeResponse, error) {
 	cb := r.Breakers[p.Name()]
 	if !cb.Allow() {
 		r.Metrics.Inc("provider_circuit_breaker_blocked_total")
-		return nil, provider.ErrProviderTimeout // Circuit is open
+		return nil, provider.ErrProviderTimeout
 	}
 
-	// Bounded retry (max 2 attempts) with backoff
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		resp, err := p.Charge(ctx, req)
@@ -85,25 +85,24 @@ func (r *Router) tryProvider(ctx context.Context, p provider.ProviderAdapter, re
 			r.Metrics.Inc("provider_success_total_" + p.Name())
 			return resp, nil
 		}
+
 		lastErr = err
 		cb.RecordResult(false)
 		r.Metrics.Inc("provider_failure_total_" + p.Name())
-		
-		// Backoff before retry
-		time.Sleep(100 * time.Millisecond) 
+
+		time.Sleep(100 * time.Millisecond)
 	}
-	
+
 	return nil, lastErr
 }
 
-// --- The Sliding Window Strategy ---
-
-// SlidingWindowStrategy tracks success rates over a window of time.
+// SlidingWindowStrategy picks the provider with the highest recent
+// success rate. It's intentionally biased toward the current leader —
+// there's no exploration (no "give the underdog a chance"). In production
+// you'd swap this for Thompson sampling or epsilon-greedy.
 type SlidingWindowStrategy struct {
-	mu sync.Mutex
-	// We'll use a simple fixed-size slice of recent results per provider.
-	// true = success, false = failure
-	history map[string][]bool
+	mu         sync.Mutex
+	history    map[string][]bool
 	windowSize int
 }
 
@@ -117,11 +116,11 @@ func NewSlidingWindowStrategy(windowSize int) *SlidingWindowStrategy {
 func (s *SlidingWindowStrategy) RecordResult(providerName string, success bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	hist := s.history[providerName]
 	hist = append(hist, success)
 	if len(hist) > s.windowSize {
-		hist = hist[1:] // drop oldest
+		hist = hist[1:] // drop the oldest result
 	}
 	s.history[providerName] = hist
 }
@@ -137,7 +136,7 @@ func (s *SlidingWindowStrategy) Pick(providers []provider.ProviderAdapter) provi
 		hist := s.history[p.Name()]
 		if len(hist) == 0 {
 			if best == nil {
-				best = p // Default to first provider if no history
+				best = p // no data yet, just pick the first one
 			}
 			continue
 		}
